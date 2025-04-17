@@ -25,14 +25,8 @@ logging.basicConfig(filename='app.log', level=logging.INFO, format='%(asctime)s 
 logger = logging.getLogger(__name__)
 
 # === In-memory storage ===
-users = {}  # {email: hashed_password}
+users = {}  # {email: {"hashed_password": str, "store_name": str}}
 user_predictions = {}  # {email: [{item_name, store_name, forecast, suggestions, timestamp, filename}]}
-
-# === Mock store mapping ===
-USER_STORE_MAPPING = {
-    'testuser@example.com': 'Store 12',
-    'testuser5@gmail.com': 'Test User Store',
-}
 
 # === Load Model ===
 try:
@@ -62,14 +56,15 @@ def register():
         data = request.get_json()
         email = data.get('email')
         password = data.get('password')
+        store_name = data.get('store_name', 'Unknown Store')
         if not email or not password:
             logger.error("Registration failed: Missing email or password")
             return jsonify({"error": "Email and password are required"}), 400
         if email in users:
             logger.error(f"Registration failed: User {email} already exists")
             return jsonify({"error": "User already exists"}), 400
-        users[email] = generate_password_hash(password)
-        logger.info(f"User registered: {email}")
+        users[email] = {"hashed_password": generate_password_hash(password), "store_name": store_name}
+        logger.info(f"User registered: {email} with store {store_name}")
         return jsonify({"message": "User registered successfully"}), 200
     except Exception as e:
         logger.error(f"Registration error: {str(e)}")
@@ -84,7 +79,8 @@ def login():
         if not email or not password:
             logger.error("Login failed: Missing email or password")
             return jsonify({"error": "Email and password are required"}), 400
-        if email not in users or not check_password_hash(users[email], password):
+        user_data = users.get(email)
+        if not user_data or not check_password_hash(user_data['hashed_password'], password):
             logger.error(f"Login failed: Invalid credentials for {email}")
             return jsonify({"error": "Invalid credentials"}), 401
         access_token = create_access_token(identity=email, expires_delta=timedelta(hours=6))
@@ -99,7 +95,8 @@ def login():
 def get_user():
     try:
         user_email = get_jwt_identity()
-        store_name = USER_STORE_MAPPING.get(user_email, 'Default Store')
+        user_data = users.get(user_email, {})
+        store_name = user_data.get("store_name", "Unknown Store")
         logger.info(f"User info retrieved for {user_email}: {store_name}")
         return jsonify({"username": user_email, "store_name": store_name}), 200
     except Exception as e:
@@ -149,7 +146,7 @@ def forecast():
         forecast_days = min(data.get('forecast_days', 7), 30)
         custom_is_holiday = data.get('is_holiday', None)
         custom_onpromotion = data.get('onpromotion', None)
-        store_name = data.get('store_name', USER_STORE_MAPPING.get(user_email, 'Default Store'))
+        store_name = data.get('store_name', users.get(user_email, {}).get('store_name', 'Unknown Store'))
         item_name = data.get('item_name', 'Item 1')
 
         # Find uploaded files
