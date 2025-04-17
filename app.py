@@ -5,10 +5,15 @@ import os
 from datetime import datetime
 import torch
 import numpy as np
+import logging
 
 app = Flask(__name__)
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'default-secret-for-local-testing')
 jwt = JWTManager(app)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 UPLOAD_FOLDER = 'Uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -16,13 +21,20 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # In-memory storage for user predictions
 user_predictions = {}
 
+# Mock user store mapping (replace with database later)
+USER_STORE_MAPPING = {
+    'user1@example.com': 'User1 Store',
+    'user2@example.com': 'User2 Store',
+    # Add more users as needed
+}
+
 # Load the scripted TFT model
 try:
     model = torch.jit.load("tft_traced_model.pt")
     model.eval()
-    print("✅ TorchScript model loaded successfully.")
+    logger.info("✅ TorchScript model loaded successfully.")
 except Exception as e:
-    print("❌ Failed to load model:", str(e))
+    logger.error("❌ Failed to load model: %s", str(e))
     raise e
 
 def validate_excel_data(df):
@@ -33,44 +45,72 @@ def validate_excel_data(df):
 def not_found(e):
     return jsonify({"error": "Not Found", "message": "The requested endpoint was not found on the server.", "status": 404}), 404
 
+@app.route('/user', methods=['GET'])
+@jwt_required()
+def get_user():
+    try:
+        user_email = get_jwt_identity()
+        logger.info("Fetching store name for user: %s", user_email)
+        store_name = USER_STORE_MAPPING.get(user_email, 'Default Store')
+        return jsonify({
+            'username': user_email,
+            'store_name': store_name
+        }), 200
+    except Exception as e:
+        logger.error("Error fetching user data: %s", str(e))
+        return jsonify({"error": "Failed to fetch user data"}), 500
+
 @app.route('/upload', methods=['POST'])
 @jwt_required()
 def upload_file():
-    user_email = get_jwt_identity()  # Get user email from JWT
+    user_email = get_jwt_identity()
+    logger.info("Received /upload request from user: %s", user_email)
     if 'file' not in request.files:
+        logger.error("No file provided")
         return jsonify({"error": "No file provided"}), 400
     
     file = request.files['file']
     if file.filename == '':
+        logger.error("No file selected")
         return jsonify({"error": "No file selected"}), 400
     
     if file and file.filename.endswith('.xlsx'):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"upload_{user_email}_{timestamp}.xlsx"  # Tie file to user
+        filename = f"upload_{user_email}_{timestamp}.xlsx"
         file_path = os.path.join(UPLOAD_FOLDER, filename)
+        logger.info("Saving file to %s", file_path)
         file.save(file_path)
         
         try:
             df = pd.read_excel(file_path)
             if not validate_excel_data(df):
+                logger.error("Invalid Excel format")
                 return jsonify({"error": "Invalid Excel format"}), 400
             
             row_count = len(df)
+            logger.info("File processed successfully, rows: %d", row_count)
             return jsonify({
                 "message": "File uploaded and validated successfully",
                 "filename": filename,
                 "row_count": row_count
             }), 200
         except Exception as e:
+            logger.error("Error processing file: %s", str(e))
             return jsonify({"error": str(e)}), 500
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info("File %s deleted", file_path)
     else:
+        logger.error("Invalid file format")
         return jsonify({"error": "Invalid file format, only .xlsx allowed"}), 400
 
 @app.route('/forecast', methods=['POST'])
 @jwt_required()
 def forecast():
     try:
-        user_email = get_jwt_identity()  # Get user email from JWT
+        user_email = get_jwt_identity()
+        logger.info("Received /forecast request from user: %s", user_email)
         data = request.get_json()
         forecast_days = min(data.get('forecast_days', 7), 30)
         custom_is_holiday = data.get('is_holiday', None)
@@ -78,10 +118,10 @@ def forecast():
         store_name = data.get('store_name', 'Store 1')
         item_name = data.get('item_name', 'Item 1')
 
-        # Find latest uploaded file for this user
         upload_dir = UPLOAD_FOLDER
         user_files = [f for f in os.listdir(upload_dir) if f.startswith(f"upload_{user_email}_") and f.endswith('.xlsx')]
         if not user_files:
+            logger.error("No uploaded files found for user: %s", user_email)
             return jsonify({"error": "No uploaded files found for this user"}), 404
         
         latest_file = max(
@@ -91,6 +131,7 @@ def forecast():
         
         df = pd.read_excel(latest_file)
         if not validate_excel_data(df):
+            logger.error("Invalid data in uploaded file")
             return jsonify({"error": "Invalid data in uploaded file"}), 400
         
         df['date'] = pd.to_datetime(df['date'])
@@ -112,6 +153,7 @@ def forecast():
         onpromotion = custom_onpromotion if custom_onpromotion and len(custom_onpromotion) == 37 else df['onpromotion'].tail(37).tolist()
 
         if len(history) < 30:
+            logger.error("Insufficient history data: need 30 days")
             return jsonify({"error": "Insufficient history data: need 30 days"}), 400
         history = history[-30:]
         
@@ -225,7 +267,6 @@ def forecast():
             "confidence": 0.9
         }]
 
-        # Store prediction for the user
         if user_email not in user_predictions:
             user_predictions[user_email] = []
         user_predictions[user_email].append({
@@ -244,13 +285,14 @@ def forecast():
         }), 200
 
     except Exception as e:
-        print("❌ Error:", str(e))
+        logger.error("Error in forecast: %s", str(e))
         return jsonify({"error": str(e)}), 500
 
 @app.route('/predictions', methods=['GET'])
 @jwt_required()
 def get_predictions():
     user_email = get_jwt_identity()
+    logger.info("Fetching predictions for user: %s", user_email)
     predictions = user_predictions.get(user_email, [])
     return jsonify({"predictions": predictions}), 200
 
