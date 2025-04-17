@@ -1,170 +1,204 @@
-from flask import Flask, request, jsonify
-from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
-import pandas as pd
 import os
-from datetime import datetime
-import torch
+import pandas as pd
 import numpy as np
+import torch
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 import logging
 
+# === Setup ===
 app = Flask(__name__)
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'default-secret-for-local-testing')
+CORS(app)
+app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'  # Replace with a secure key
 jwt = JWTManager(app)
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 UPLOAD_FOLDER = 'Uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['ALLOWED_EXTENSIONS'] = {'xlsx'}
 
-# In-memory storage for user predictions
-user_predictions = {}
+logging.basicConfig(filename='app.log', level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
 
-# Mock user store mapping (replace with database later)
+# === In-memory storage ===
+users = {}  # {email: hashed_password}
+user_predictions = {}  # {email: [{item_name, store_name, forecast, suggestions, timestamp, filename}]}
+
+# === Mock store mapping ===
 USER_STORE_MAPPING = {
-    'user1@example.com': 'User1 Store',
-    'user2@example.com': 'User2 Store',
-    # Add more users as needed
+    'testuser@example.com': 'Store 12',
+    'testuser5@gmail.com': 'Test User Store',
 }
 
-# Load the scripted TFT model
+# === Load Model ===
 try:
     model = torch.jit.load("tft_traced_model.pt")
     model.eval()
-    logger.info("✅ TorchScript model loaded successfully.")
+    logger.info("TFT model loaded successfully")
 except Exception as e:
-    logger.error("❌ Failed to load model: %s", str(e))
-    raise e
+    logger.error(f"Failed to load TFT model: {str(e)}")
+    raise
+
+# === Utilities ===
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def normalize_email(email):
+    """Replace special characters in email for filename safety."""
+    return email.replace('@', '_').replace('.', '_')
 
 def validate_excel_data(df):
-    required_columns = ['date', 'history', 'onpromotion', 'is_holiday', 'transactions', 'store_nbr', 'item_nbr']
+    required_columns = ['date', 'store_nbr', 'item_nbr', 'history', 'transactions', 'onpromotion', 'is_holiday']
     return all(col in df.columns for col in required_columns)
 
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "Not Found", "message": "The requested endpoint was not found on the server.", "status": 404}), 404
+# === Endpoints ===
+@app.route('/register', methods=['POST'])
+def register():
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+        if not email or not password:
+            logger.error("Registration failed: Missing email or password")
+            return jsonify({"error": "Email and password are required"}), 400
+        if email in users:
+            logger.error(f"Registration failed: User {email} already exists")
+            return jsonify({"error": "User already exists"}), 400
+        users[email] = generate_password_hash(password)
+        logger.info(f"User registered: {email}")
+        return jsonify({"message": "User registered successfully"}), 200
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        return jsonify({"error": f"Registration failed: {str(e)}"}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+        if not email or not password:
+            logger.error("Login failed: Missing email or password")
+            return jsonify({"error": "Email and password are required"}), 400
+        if email not in users or not check_password_hash(users[email], password):
+            logger.error(f"Login failed: Invalid credentials for {email}")
+            return jsonify({"error": "Invalid credentials"}), 401
+        access_token = create_access_token(identity=email, expires_delta=timedelta(hours=6))
+        logger.info(f"Login successful: {email}")
+        return jsonify({"access_token": access_token}), 200
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}")
+        return jsonify({"error": f"Login failed: {str(e)}"}), 500
 
 @app.route('/user', methods=['GET'])
 @jwt_required()
 def get_user():
     try:
         user_email = get_jwt_identity()
-        logger.info("Fetching store name for user: %s", user_email)
         store_name = USER_STORE_MAPPING.get(user_email, 'Default Store')
-        return jsonify({
-            'username': user_email,
-            'store_name': store_name
-        }), 200
+        logger.info(f"User info retrieved for {user_email}: {store_name}")
+        return jsonify({"username": user_email, "store_name": store_name}), 200
     except Exception as e:
-        logger.error("Error fetching user data: %s", str(e))
-        return jsonify({"error": "Failed to fetch user data"}), 500
+        logger.error(f"User error: {str(e)}")
+        return jsonify({"error": f"Error retrieving user info: {str(e)}"}), 500
 
 @app.route('/upload', methods=['POST'])
 @jwt_required()
-def upload_file():
-    user_email = get_jwt_identity()
-    logger.info("Received /upload request from user: %s", user_email)
-    if 'file' not in request.files:
-        logger.error("No file provided")
-        return jsonify({"error": "No file provided"}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        logger.error("No file selected")
-        return jsonify({"error": "No file selected"}), 400
-    
-    if file and file.filename.endswith('.xlsx'):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"upload_{user_email}_{timestamp}.xlsx"
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        logger.info("Saving file to %s", file_path)
-        file.save(file_path)
-        
-        try:
-            df = pd.read_excel(file_path)
-            if not validate_excel_data(df):
-                logger.error("Invalid Excel format")
-                return jsonify({"error": "Invalid Excel format"}), 400
-            
+def upload():
+    try:
+        user_email = get_jwt_identity()
+        normalized_email = normalize_email(user_email)
+        if 'file' not in request.files:
+            logger.error(f"Upload failed for {user_email}: No file part")
+            return jsonify({"error": "No file part"}), 400
+        file = request.files['file']
+        if file.filename == '':
+            logger.error(f"Upload failed for {user_email}: No selected file")
+            return jsonify({"error": "No selected file"}), 400
+        if file and allowed_file(file.filename):
+            safe_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"upload_{normalized_email}_{safe_time}.xlsx"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            df = pd.read_excel(filepath)
             row_count = len(df)
-            logger.info("File processed successfully, rows: %d", row_count)
+            logger.info(f"File uploaded for {user_email}: {filename}, rows: {row_count}")
             return jsonify({
-                "message": "File uploaded and validated successfully",
+                "message": "File uploaded successfully",
                 "filename": filename,
                 "row_count": row_count
             }), 200
-        except Exception as e:
-            logger.error("Error processing file: %s", str(e))
-            return jsonify({"error": str(e)}), 500
-        finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logger.info("File %s deleted", file_path)
-    else:
-        logger.error("Invalid file format")
-        return jsonify({"error": "Invalid file format, only .xlsx allowed"}), 400
+        logger.error(f"Upload failed for {user_email}: Invalid file type")
+        return jsonify({"error": "Invalid file format. Only .xlsx files are allowed"}), 400
+    except Exception as e:
+        logger.error(f"Upload error for {user_email}: {str(e)}")
+        return jsonify({"error": f"Failed to upload file: {str(e)}"}), 500
 
 @app.route('/forecast', methods=['POST'])
 @jwt_required()
 def forecast():
+    user_email = get_jwt_identity()
+    normalized_email = normalize_email(user_email)
     try:
-        user_email = get_jwt_identity()
-        logger.info("Received /forecast request from user: %s", user_email)
+        logger.info(f"Received /forecast request from user: {user_email}")
         data = request.get_json()
         forecast_days = min(data.get('forecast_days', 7), 30)
         custom_is_holiday = data.get('is_holiday', None)
         custom_onpromotion = data.get('onpromotion', None)
-        store_name = data.get('store_name', 'Store 1')
+        store_name = data.get('store_name', USER_STORE_MAPPING.get(user_email, 'Default Store'))
         item_name = data.get('item_name', 'Item 1')
 
-        upload_dir = UPLOAD_FOLDER
-        user_files = [f for f in os.listdir(upload_dir) if f.startswith(f"upload_{user_email}_") and f.endswith('.xlsx')]
+        # Find uploaded files
+        user_files = [f for f in os.listdir(UPLOAD_FOLDER) if f.startswith(f"upload_{normalized_email}_") and f.endswith('.xlsx')]
+        logger.info(f"Files found for {user_email} in {os.path.abspath(UPLOAD_FOLDER)}: {user_files}")
         if not user_files:
-            logger.error("No uploaded files found for user: %s", user_email)
+            logger.error(f"No uploaded files found for {user_email}")
             return jsonify({"error": "No uploaded files found for this user"}), 404
-        
-        latest_file = max(
-            [os.path.join(upload_dir, f) for f in user_files],
-            key=os.path.getctime
-        )
-        
+
+        # Use the most recent file
+        latest_file = max([os.path.join(UPLOAD_FOLDER, f) for f in user_files], key=os.path.getctime)
+        logger.info(f"Using file for forecast: {latest_file}")
         df = pd.read_excel(latest_file)
         if not validate_excel_data(df):
-            logger.error("Invalid data in uploaded file")
+            logger.error(f"Invalid data in file: {latest_file}")
             return jsonify({"error": "Invalid data in uploaded file"}), 400
-        
+
+        # Preprocess data
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
-        
-        df['store_nbr'] = df['store_nbr'].fillna(1).astype(int)
-        df['item_nbr'] = df['item_nbr'].fillna(1).astype(int)
-        df['onpromotion'] = df['onpromotion'].fillna(0).astype(int)
-        df['is_holiday'] = df['is_holiday'].fillna(0).astype(int)
-        df['transactions'] = df['transactions'].fillna(0).astype(float)
-        df['history'] = df['history'].fillna(0).astype(float)
-        
+        df.fillna({
+            'store_nbr': 1,
+            'item_nbr': 1,
+            'onpromotion': 0,
+            'is_holiday': 0,
+            'transactions': 0,
+            'history': 0
+        }, inplace=True)
+        df = df.astype({
+            'store_nbr': int,
+            'item_nbr': int,
+            'onpromotion': int,
+            'is_holiday': int,
+            'transactions': float,
+            'history': float
+        })
+
         store_nbr = df['store_nbr'].iloc[-1]
         item_nbr = df['item_nbr'].iloc[-1]
         history = df['history'].tail(30).tolist()
         transactions = df['transactions'].tail(37).tolist()
-        
-        is_holiday = custom_is_holiday if custom_is_holiday and len(custom_is_holiday) == 37 else df['is_holiday'].tail(37).tolist()
-        onpromotion = custom_onpromotion if custom_onpromotion and len(custom_onpromotion) == 37 else df['onpromotion'].tail(37).tolist()
 
-        if len(history) < 30:
-            logger.error("Insufficient history data: need 30 days")
-            return jsonify({"error": "Insufficient history data: need 30 days"}), 400
-        history = history[-30:]
-        
-        max_horizon = 30
-        time_steps = 37 + max_horizon
-        transactions = transactions[-37:] + [transactions[-1]] * max_horizon
-        is_holiday = is_holiday[-37:] + [is_holiday[-1]] * max_horizon
-        onpromotion = onpromotion[-37:] + [onpromotion[-1]] * max_horizon
+        is_holiday = custom_is_holiday if custom_is_holiday and len(custom_is_holiday) >= 37 else df['is_holiday'].tail(37).tolist()
+        onpromotion = custom_onpromotion if custom_onpromotion and len(custom_onpromotion) >= 37 else df['onpromotion'].tail(37).tolist()
 
-        encoder_len = 30
-        decoder_len = 1
+        # Extend arrays
+        transactions = transactions[-37:] + [transactions[-1]] * 30
+        is_holiday = is_holiday[-37:] + [is_holiday[-1]] * 30
+        onpromotion = onpromotion[-37:] + [onpromotion[-1]] * 30
 
         predictions = {"p10": [], "p50": [], "p90": []}
         current_history = history.copy()
@@ -172,20 +206,17 @@ def forecast():
         current_is_holiday = is_holiday.copy()
         current_transactions = transactions.copy()
 
+        # Generate forecasts
         for day in range(forecast_days):
-            encoder_lengths = torch.tensor([encoder_len], dtype=torch.long)
-            decoder_lengths = torch.tensor([decoder_len], dtype=torch.long)
+            encoder_len = 30
+            decoder_len = 1
 
             history_tensor = torch.tensor(current_history[-encoder_len:], dtype=torch.float).unsqueeze(0)
             transactions_tensor = torch.tensor(current_transactions[day:37+day], dtype=torch.float).unsqueeze(0)
             time_idx = torch.arange(day, 37+day, dtype=torch.float).unsqueeze(0)
             day_of_week = torch.tensor([(i % 7) for i in range(day, 37+day)], dtype=torch.float).unsqueeze(0)
             month = torch.tensor([((i % 12) + 1) for i in range(day, 37+day)], dtype=torch.float).unsqueeze(0)
-            dummy1 = torch.zeros(1, 37, dtype=torch.float)
-            dummy2 = torch.zeros(1, 37, dtype=torch.float)
-            dummy3 = torch.zeros(1, 37, dtype=torch.float)
-            dummy4 = torch.zeros(1, 37, dtype=torch.float)
-            dummy5 = torch.zeros(1, 37, dtype=torch.float)
+            dummy = [torch.zeros(1, 37, dtype=torch.float) for _ in range(5)]
 
             encoder_cont = torch.stack([
                 history_tensor[:, :encoder_len],
@@ -193,11 +224,7 @@ def forecast():
                 time_idx[:, :encoder_len],
                 day_of_week[:, :encoder_len],
                 month[:, :encoder_len],
-                dummy1[:, :encoder_len],
-                dummy2[:, :encoder_len],
-                dummy3[:, :encoder_len],
-                dummy4[:, :encoder_len],
-                dummy5[:, :encoder_len]
+                *[d[:, :encoder_len] for d in dummy]
             ], dim=-1)
 
             decoder_cont = torch.stack([
@@ -206,11 +233,7 @@ def forecast():
                 time_idx[:, encoder_len:encoder_len+decoder_len],
                 day_of_week[:, encoder_len:encoder_len+decoder_len],
                 month[:, encoder_len:encoder_len+decoder_len],
-                dummy1[:, encoder_len:encoder_len+decoder_len],
-                dummy2[:, encoder_len:encoder_len+decoder_len],
-                dummy3[:, encoder_len:encoder_len+decoder_len],
-                dummy4[:, encoder_len:encoder_len+decoder_len],
-                dummy5[:, encoder_len:encoder_len+decoder_len]
+                *[d[:, encoder_len:encoder_len+decoder_len] for d in dummy]
             ], dim=-1)
 
             store_tensor = torch.tensor([[store_nbr] * 37], dtype=torch.long)
@@ -242,40 +265,37 @@ def forecast():
                 "decoder_cont": decoder_cont,
                 "encoder_cat": encoder_cat,
                 "decoder_cat": decoder_cat,
-                "encoder_lengths": encoder_lengths,
-                "decoder_lengths": decoder_lengths,
+                "encoder_lengths": torch.tensor([encoder_len]),
+                "decoder_lengths": torch.tensor([decoder_len]),
                 "target_scale": target_scale
             }
 
             with torch.no_grad():
                 output = model(model_input)
 
-            p10 = output[0][:, :, 1].squeeze().item()
-            p50 = output[0][:, :, 3].squeeze().item()
-            p90 = output[0][:, :, 5].squeeze().item()
+            p10, p50, p90 = output[0][:, :, 1].item(), output[0][:, :, 3].item(), output[0][:, :, 5].item()
             predictions["p10"].append(p10)
             predictions["p50"].append(p50)
             predictions["p90"].append(p90)
-
             current_history.append(p50)
             current_history = current_history[1:]
 
-        avg_forecast = np.mean(predictions["p50"])
         suggestions = [{
             "type": "stock_adjustment",
-            "message": f"Prepare stock for ~{round(avg_forecast)} units/day of {item_name} at {store_name}.",
+            "message": f"Prepare stock for ~{round(np.mean(predictions['p50']))} units/day of {item_name} at {store_name}.",
             "confidence": 0.9
         }]
 
-        if user_email not in user_predictions:
-            user_predictions[user_email] = []
-        user_predictions[user_email].append({
+        # Save predictions
+        user_predictions.setdefault(user_email, []).append({
             "item_name": item_name,
             "store_name": store_name,
             "forecast": predictions,
             "suggestions": suggestions,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "filename": os.path.basename(latest_file)
         })
+        logger.info(f"Forecast saved for {user_email}: {item_name} at {store_name}")
 
         return jsonify({
             "forecast": predictions,
@@ -285,16 +305,21 @@ def forecast():
         }), 200
 
     except Exception as e:
-        logger.error("Error in forecast: %s", str(e))
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Forecast error for {user_email}: {str(e)}")
+        return jsonify({"error": f"Error generating forecast: {str(e)}"}), 500
 
 @app.route('/predictions', methods=['GET'])
 @jwt_required()
 def get_predictions():
-    user_email = get_jwt_identity()
-    logger.info("Fetching predictions for user: %s", user_email)
-    predictions = user_predictions.get(user_email, [])
-    return jsonify({"predictions": predictions}), 200
+    try:
+        user_email = get_jwt_identity()
+        predictions = user_predictions.get(user_email, [])
+        logger.info(f"Retrieved {len(predictions)} predictions for {user_email}")
+        return jsonify({"predictions": predictions}), 200
+    except Exception as e:
+        logger.error(f"Predictions error for {user_email}: {str(e)}")
+        return jsonify({"error": f"Error retrieving predictions: {str(e)}"}), 500
 
+# === Run ===
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
