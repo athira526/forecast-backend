@@ -70,3 +70,13 @@ McKinsey, Gartner, Accenture reports on AI in FMCG
 Favorita Grocery Sales dataset
 
 
+## Screenshots
+![Screenshot 2025-06-24 161844](https://github.com/user-attachments/assets/be2c321c-c6ee-4f47-acbe-cec239c74037)
+
+
+![Screenshot 2025-06-24 161852](https://github.com/user-attachments/assets/ced41418-54c7-47fd-9fb7-ae34de11c25b)
+
+![Screenshot 2025-06-24 161710](https://github.com/user-attachments/assets/4659c6f4-183a-42e2-9f24-915ef1fd2706)
+
+
+![WhatsApp Image 2025-04-19 at 16 08 17_0d68dbce](https://github.com/user-attachments/assets/0f32a180-eadb-4995-a4d7-e357a05a706c)
